@@ -292,7 +292,7 @@ ui <- page_sidebar(
             div(class="text-center", uiOutput("risk_badge")),
             hr(),
             div(class="alert alert-info", style="margin-top:10px;",
-                h6("🤖 AI Double Check (Llama 3):", style="font-weight:bold;"),
+                h6("AI Opinion:", style="font-weight:bold;"),
                 textOutput("ai_commentary"),
                 div(class="text-muted small text-center pt-2", "⚠️ AI commentary is informational only.")
             )
