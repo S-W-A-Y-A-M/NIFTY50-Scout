@@ -33,7 +33,8 @@ sector_map <- list(
   "MINING" = c("ADANIENT.NS")
 )
 
-scan_list <- unique(c("NIFTYBEES.NS", unlist(sector_map)))
+# CHANGED: Removed NIFTYBEES.NS and sorted alphabetically
+scan_list <- sort(unique(unlist(sector_map)))
 
 get_sector_name <- function(sym) {
   for(sec in names(sector_map)) {
@@ -87,7 +88,7 @@ get_ai_best_pick <- function(symbol, score, price) {
       url = "https://openrouter.ai/api/v1/chat/completions",
       add_headers("Authorization" = paste("Bearer", OPENROUTER_API_KEY), "Content-Type" = "application/json"),
       body = toJSON(list(
-        model = "meta-llama/llama-3-8b-instruct:free", 
+        model = "meta-llama/llama-3-8b-instruct", 
         messages = list(list(role = "user", content = prompt)),
         max_tokens = 40, temperature = 0.4
       ), auto_unbox = TRUE)
@@ -195,8 +196,13 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
   m_line <- as.numeric(res$macd_line)
   m_sig  <- as.numeric(res$macd_sig)
   if (is_valid(m_line) && is_valid(m_sig)) {
-    if (m_line > m_sig) score <- score + 5 else score <- score - 5
-    if (abs(m_line - m_sig) < 0.02) score <- score + 2 
+    if (abs(m_line - m_sig) < 0.02) {
+      score <- score + 2 
+    } else if (m_line > m_sig) {
+      score <- score + 5
+    } else {
+      score <- score - 5
+    }
   }
   
   # Sector Bias
@@ -210,19 +216,21 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
   score <- max(min(score, 100), 0)
   
   verdict <- "MEDIOCRE"
-  risk_label <- "CHOPPY"
+  risk_label <- "⚠️ SPECULATIVE"
   color <- "secondary"
   
   if (score >= 80) { 
-    verdict <- "▲ STRONG BUY"; color <- "success"; risk_label <- "LOW RISK MOMENTUM"
-  } else if (score >= 65) {
+    verdict <- "▲ STRONG BUY"; color <- "success"; risk_label <- "💎 HIGH CONVICTION"
+  } else if (score >= 75) {
+    verdict <- "BUY"; color <- "primary"; risk_label <- "🚀 MOMENTUM"
+  } else if (score >= 60) {
     verdict <- "WATCH"; color <- "warning"; risk_label <- "MEDIUM RISK"
   } else if (score <= 40) {
     verdict <- "▼ TRASH (DUMP)"; color <- "danger"; risk_label <- "HIGH RISK"
   }
   
   if (!is.null(market_score) && market_score < 45 && score < 75) {
-    verdict <- "NO TRADE ZONE"; color <- "dark"; risk_label <- "MARKET WEAK"
+    verdict <- "NO TRADE ZONE"; color <- "dark"; risk_label <- "⛔ MARKET WEAK"
   }
   
   display_name <- symbol
@@ -268,6 +276,7 @@ ui <- page_sidebar(
   div(
     class = "container-fluid",
     
+    # 1. VERDICT CARD
     card(
       min_height = "180px",
       card_header("Quantitative Verdict", class = "bg-dark text-white"),
@@ -279,7 +288,7 @@ ui <- page_sidebar(
             h3(textOutput("stock_price"), style = "color: #555;")
         ),
         div(class = "p-4",
-            h5("Risk Profile:", class="text-secondary text-center"),
+            h5("Confidence Level:", class="text-secondary text-center"),
             div(class="text-center", uiOutput("risk_badge")),
             hr(),
             div(class="alert alert-info", style="margin-top:10px;",
@@ -292,6 +301,7 @@ ui <- page_sidebar(
     ),
     br(),
     
+    # 2. SECTOR & HIT LIST
     layout_columns(
       col_widths = breakpoints(xs = 12, md = 12),
       uiOutput("sector_card"), 
@@ -299,6 +309,7 @@ ui <- page_sidebar(
     ),
     br(),
     
+    # 3. METRICS
     layout_columns(
       col_widths = breakpoints(xs = 12, md = 4),
       card(card_header("Technical DNA"), tableOutput("metrics_table")),
@@ -317,6 +328,7 @@ server <- function(input, output, session) {
   sector_data <- reactiveVal(NULL)
   market_score <- reactiveVal(50) 
   ai_output_val <- reactiveVal("Pending...") 
+  ai_busy <- reactiveVal(FALSE) 
   
   process_stock <- function(symbol, tf) {
     withProgress(message = paste("Analyzing", symbol, "..."), {
@@ -333,19 +345,26 @@ server <- function(input, output, session) {
       
       res$ai_check <- "Calculating..."
       current_data(res)
-      ai_output_val("Checking...")
       
-      should_run_ai <- (res$verdict %in% c("▲ STRONG BUY", "▼ TRASH (DUMP)")) || (symbol == "NIFTYBEES.NS")
-      
-      future({
-        if (should_run_ai) {
-          get_ai_double_check(res)
-        } else {
-          "AI skipped (low-confidence signal)"
-        }
-      }) %...>% (function(ai_result) {
-        ai_output_val(ai_result)
-      })
+      if (!ai_busy() || symbol == "NIFTYBEES.NS") {
+        ai_output_val("Checking...")
+        ai_busy(TRUE)
+        
+        should_run_ai <- (res$verdict %in% c("▲ STRONG BUY", "▼ TRASH (DUMP)")) || (symbol == "NIFTYBEES.NS")
+        
+        future({
+          if (should_run_ai) {
+            get_ai_double_check(res)
+          } else {
+            "AI skipped (low-confidence signal)"
+          }
+        }) %...>% (function(ai_result) {
+          ai_output_val(ai_result)
+          ai_busy(FALSE)
+        })
+      } else {
+        ai_output_val("AI Busy (Slow down click)...")
+      }
       
       return(res)
     })
@@ -355,6 +374,8 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_analysis, {
     req(input$stock_input)
+    hit_list_data(NULL)
+    sector_data(NULL)
     process_stock(input$stock_input, input$timeframe)
   })
   
@@ -366,7 +387,6 @@ server <- function(input, output, session) {
     
     withProgress(message = paste("SCANNING (", toupper(input$timeframe), ")..."), value = 0, {
       
-      # FIX: Optimization - Use List Builder
       rows_list <- list()
       sector_scores <- list()
       total <- length(scan_list)
@@ -384,20 +404,17 @@ server <- function(input, output, session) {
         
         if(!is.null(res)) {
           sec_name <- get_sector_name(sym)
-          
           if(res$score >= 0) { 
             new_row <- data.frame(Symbol = sym, Sector = sec_name, Price = res$price, Score = res$score, 
                                   VolRatio = res$vol_ratio, Verdict = res$verdict, Risk = res$risk)
             rows_list[[length(rows_list) + 1]] <- new_row
           }
-          
           if(sec_name != "OTHER") {
             sector_scores[[sec_name]] <- c(sector_scores[[sec_name]], res$score)
           }
         }
       }
       
-      # Combine Rows
       if(length(rows_list) > 0) {
         valid_buys <- do.call(rbind, rows_list)
       } else {
@@ -405,7 +422,6 @@ server <- function(input, output, session) {
                                  VolRatio=numeric(), Verdict=character(), Risk=character())
       }
       
-      # Sector Ranks
       sec_df <- data.frame(Sector=character(), MedianScore=numeric())
       for(sec in names(sector_scores)) {
         avg <- median(sector_scores[[sec]], na.rm=TRUE)
@@ -414,28 +430,22 @@ server <- function(input, output, session) {
       sec_df <- sec_df[order(-sec_df$MedianScore), ]
       sector_data(sec_df)
       
-      # Victory Lap: Apply Sector Bias & Re-Rank
       if(nrow(sec_df) > 0 && nrow(valid_buys) > 0) {
         top_sec <- sec_df$Sector[1]
         is_top_sec <- valid_buys$Sector == top_sec
-        
-        # Boost Score
         valid_buys$Score[is_top_sec] <- pmin(valid_buys$Score[is_top_sec] + 5, 100)
         
-        # CRITICAL FIX: Recompute Verdicts based on new Score
-        valid_buys$Verdict <- ifelse(
-          valid_buys$Score >= 80, "▲ STRONG BUY",
-          ifelse(valid_buys$Score >= 65, "WATCH",
-          ifelse(valid_buys$Score <= 40, "▼ TRASH (DUMP)", "MEDIOCRE")))
+        valid_buys$Verdict <- ifelse(valid_buys$Score >= 80, "▲ STRONG BUY",
+                              ifelse(valid_buys$Score >= 75, "BUY",
+                              ifelse(valid_buys$Score >= 60, "WATCH",
+                              ifelse(valid_buys$Score <= 40, "▼ TRASH (DUMP)", "MEDIOCRE"))))
         
-        valid_buys$Risk <- ifelse(
-          valid_buys$Score >= 80, "LOW RISK MOMENTUM",
-          ifelse(valid_buys$Score >= 65, "MEDIUM RISK",
-          ifelse(valid_buys$Score <= 40, "HIGH RISK", "CHOPPY")))
+        valid_buys$Risk <- ifelse(valid_buys$Score >= 80, "💎 HIGH CONVICTION",
+                           ifelse(valid_buys$Score >= 75, "🚀 MOMENTUM",
+                           ifelse(valid_buys$Score <= 40, "HIGH RISK", "⚠️ SPECULATIVE")))
       }
       
       if(nrow(valid_buys) > 0) {
-        # Filter for display (Score > 70)
         final_list <- valid_buys[valid_buys$Score >= 70, ]
         if(nrow(final_list) > 0) final_list <- final_list[order(-final_list$Score), ]
       } else {
@@ -444,7 +454,6 @@ server <- function(input, output, session) {
       
       hit_list_data(final_list)
       
-      # AI Pick
       if(nrow(final_list) > 0) {
         top_stock <- final_list[1,]
         ai_output_val("Finding Scan Winner...")
@@ -460,31 +469,25 @@ server <- function(input, output, session) {
   })
   
   output$downloadData <- downloadHandler(
-    filename = function() { 
-      paste("hit_list_", input$timeframe, "_", Sys.Date(), ".csv", sep = "") 
-    },
+    filename = function() { paste("hit_list_", input$timeframe, "_", Sys.Date(), ".csv", sep = "") },
     content = function(file) { req(hit_list_data()); write.csv(hit_list_data(), file, row.names = FALSE) }
   )
   
-  # --- RENDERERS ---
   output$stock_name <- renderText({ req(current_data()); current_data()$symbol })
   
   output$verdict_badge <- renderUI({
     req(current_data()); d <- current_data()
-    color_code <- if(d$color == "success") "#28a745" else if(d$color == "danger") "#dc3545" else if(d$color == "dark") "#333" else "#ffc107"
+    color_code <- if(d$color == "success") "#28a745" else if(d$color == "primary") "#007bff" else if(d$color == "danger") "#dc3545" else if(d$color == "dark") "#333" else "#ffc107"
     h1(d$verdict, style = paste0("font-weight: 900; color: ", color_code, ";"))
   })
   
   output$risk_badge <- renderUI({
     req(current_data()); d <- current_data()
-    color_code <- if(d$risk == "LOW RISK MOMENTUM") "success" else if(d$risk == "HIGH RISK") "danger" else "warning"
+    color_code <- if(grepl("HIGH CONVICTION", d$risk)) "success" else if(grepl("MOMENTUM", d$risk)) "primary" else if(grepl("HIGH RISK", d$risk)) "danger" else "warning"
     span(class=paste0("badge bg-", color_code), style="font-size: 1.2rem;", d$risk)
   })
   
-  output$ai_commentary <- renderText({
-    ai_output_val()
-  })
-  
+  output$ai_commentary <- renderText({ ai_output_val() })
   output$stock_price <- renderText({ req(current_data()); d <- current_data(); paste0("₹", format(d$price, big.mark=",")) })
   
   output$sector_card <- renderUI({
