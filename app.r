@@ -33,10 +33,8 @@ sector_map <- list(
   "MINING" = c("ADANIENT.NS")
 )
 
-# Scan list
 scan_list <- unique(c("NIFTYBEES.NS", unlist(sector_map)))
 
-# Helper: Find Sector for a stock
 get_sector_name <- function(sym) {
   for(sec in names(sector_map)) {
     if(sym %in% sector_map[[sec]]) return(sec)
@@ -100,7 +98,6 @@ get_ai_best_pick <- function(symbol, score, price) {
 
 # --- 4. DATA ENGINE ---
 
-# Added top_sector argument for bias injection
 get_technical_analysis <- function(symbol, timeframe = "daily", market_score = NULL, top_sector = NULL) {
   
   data <- tryCatch({
@@ -127,7 +124,6 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
     
     list(
       rsi = tail(rsi_series, 1),
-      # FIX A: Protect lag() edge case
       rsi_prev = if (length(rsi_series) > 10) tail(lag(rsi_series, 5), 1) else NA,
       ema20 = tail(ema20_series, 1),
       ema50 = tail(ema50_series, 1),
@@ -152,7 +148,7 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
   
   score <- 50
   
-  # 1. Market Context Check
+  # 1. Market Context
   if (!is.null(market_score) && symbol != "^NSEI" && symbol != "NIFTYBEES.NS") {
     if (market_score < 50) score <- score - 15
   }
@@ -203,7 +199,7 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
     if (abs(m_line - m_sig) < 0.02) score <- score + 2 
   }
   
-  # FIX B: Sector Bias Check
+  # Sector Bias
   if (!is.null(top_sector)) {
     current_stock_sector <- get_sector_name(symbol)
     if (current_stock_sector == top_sector) {
@@ -213,7 +209,6 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
   
   score <- max(min(score, 100), 0)
   
-  # Labels
   verdict <- "MEDIOCRE"
   risk_label <- "CHOPPY"
   color <- "secondary"
@@ -273,7 +268,6 @@ ui <- page_sidebar(
   div(
     class = "container-fluid",
     
-    # 1. VERDICT CARD
     card(
       min_height = "180px",
       card_header("Quantitative Verdict", class = "bg-dark text-white"),
@@ -298,7 +292,6 @@ ui <- page_sidebar(
     ),
     br(),
     
-    # 2. SECTOR & HIT LIST
     layout_columns(
       col_widths = breakpoints(xs = 12, md = 12),
       uiOutput("sector_card"), 
@@ -306,7 +299,6 @@ ui <- page_sidebar(
     ),
     br(),
     
-    # 3. METRICS
     layout_columns(
       col_widths = breakpoints(xs = 12, md = 4),
       card(card_header("Technical DNA"), tableOutput("metrics_table")),
@@ -329,7 +321,6 @@ server <- function(input, output, session) {
   process_stock <- function(symbol, tf) {
     withProgress(message = paste("Analyzing", symbol, "..."), {
       
-      # FIX B (Part 1): Check if we know the top sector from a previous scan
       top_sec_bias <- NULL
       if (!is.null(sector_data()) && nrow(sector_data()) > 0) {
         top_sec_bias <- sector_data()$Sector[1]
@@ -364,7 +355,6 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_analysis, {
     req(input$stock_input)
-    # hit_list_data(NULL) # Removed this so we keep the list if we just analyze one stock
     process_stock(input$stock_input, input$timeframe)
   })
   
@@ -375,8 +365,9 @@ server <- function(input, output, session) {
     market_score(curr_mkt_score) 
     
     withProgress(message = paste("SCANNING (", toupper(input$timeframe), ")..."), value = 0, {
-      valid_buys <- data.frame(Symbol=character(), Sector=character(), Price=numeric(), Score=numeric(), 
-                               VolRatio=numeric(), Verdict=character(), Risk=character())
+      
+      # FIX: Optimization - Use List Builder
+      rows_list <- list()
       sector_scores <- list()
       total <- length(scan_list)
       count <- 0
@@ -387,7 +378,6 @@ server <- function(input, output, session) {
         
         if (sym == "NIFTYBEES.NS" || sym == "^NSEI") next 
         
-        # Pass 1: Raw Analysis
         res <- tryCatch({
            get_technical_analysis(sym, timeframe = input$timeframe, market_score = curr_mkt_score)
         }, error = function(e) return(NULL))
@@ -395,12 +385,10 @@ server <- function(input, output, session) {
         if(!is.null(res)) {
           sec_name <- get_sector_name(sym)
           
-          # Only store if decently high score to save memory, or if you want full list remove this check.
-          # For scan speed, let's keep all valid results to sort later.
           if(res$score >= 0) { 
             new_row <- data.frame(Symbol = sym, Sector = sec_name, Price = res$price, Score = res$score, 
                                   VolRatio = res$vol_ratio, Verdict = res$verdict, Risk = res$risk)
-            valid_buys <- rbind(valid_buys, new_row)
+            rows_list[[length(rows_list) + 1]] <- new_row
           }
           
           if(sec_name != "OTHER") {
@@ -409,7 +397,15 @@ server <- function(input, output, session) {
         }
       }
       
-      # Calculate Sector Ranks
+      # Combine Rows
+      if(length(rows_list) > 0) {
+        valid_buys <- do.call(rbind, rows_list)
+      } else {
+        valid_buys <- data.frame(Symbol=character(), Sector=character(), Price=numeric(), Score=numeric(), 
+                                 VolRatio=numeric(), Verdict=character(), Risk=character())
+      }
+      
+      # Sector Ranks
       sec_df <- data.frame(Sector=character(), MedianScore=numeric())
       for(sec in names(sector_scores)) {
         avg <- median(sector_scores[[sec]], na.rm=TRUE)
@@ -418,26 +414,33 @@ server <- function(input, output, session) {
       sec_df <- sec_df[order(-sec_df$MedianScore), ]
       sector_data(sec_df)
       
-      # FIX B (Part 2): Victory Lap - Apply Sector Bias
-      if(nrow(sec_df) > 0) {
+      # Victory Lap: Apply Sector Bias & Re-Rank
+      if(nrow(sec_df) > 0 && nrow(valid_buys) > 0) {
         top_sec <- sec_df$Sector[1]
+        is_top_sec <- valid_buys$Sector == top_sec
         
-        # Add +5 to stocks in top sector
-        # We perform clamp to 100 max
-        if(nrow(valid_buys) > 0) {
-           is_top_sec <- valid_buys$Sector == top_sec
-           valid_buys$Score[is_top_sec] <- pmin(valid_buys$Score[is_top_sec] + 5, 100)
-           
-           # Recalculate Verdicts if Score changed (Simple Update)
-           # Ideally we call logic again, but here we just update score for ranking.
-           # Stocks that jumped from 75->80 might deserve "STRONG BUY", but for simplicity
-           # we just sort by the boosted score.
-        }
+        # Boost Score
+        valid_buys$Score[is_top_sec] <- pmin(valid_buys$Score[is_top_sec] + 5, 100)
+        
+        # CRITICAL FIX: Recompute Verdicts based on new Score
+        valid_buys$Verdict <- ifelse(
+          valid_buys$Score >= 80, "▲ STRONG BUY",
+          ifelse(valid_buys$Score >= 65, "WATCH",
+          ifelse(valid_buys$Score <= 40, "▼ TRASH (DUMP)", "MEDIOCRE")))
+        
+        valid_buys$Risk <- ifelse(
+          valid_buys$Score >= 80, "LOW RISK MOMENTUM",
+          ifelse(valid_buys$Score >= 65, "MEDIUM RISK",
+          ifelse(valid_buys$Score <= 40, "HIGH RISK", "CHOPPY")))
       }
       
-      # Filter for display (Score > 70)
-      final_list <- valid_buys[valid_buys$Score >= 70, ]
-      if(nrow(final_list) > 0) final_list <- final_list[order(-final_list$Score), ]
+      if(nrow(valid_buys) > 0) {
+        # Filter for display (Score > 70)
+        final_list <- valid_buys[valid_buys$Score >= 70, ]
+        if(nrow(final_list) > 0) final_list <- final_list[order(-final_list$Score), ]
+      } else {
+        final_list <- valid_buys
+      }
       
       hit_list_data(final_list)
       
@@ -456,7 +459,6 @@ server <- function(input, output, session) {
     })
   })
   
-  # FIX C: Smart CSV Export Name
   output$downloadData <- downloadHandler(
     filename = function() { 
       paste("hit_list_", input$timeframe, "_", Sys.Date(), ".csv", sep = "") 
