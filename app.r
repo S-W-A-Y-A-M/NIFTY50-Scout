@@ -8,15 +8,20 @@ library(jsonlite)
 library(dotenv)    
 library(future)    
 library(promises)
+library(future.apply)
+library(readr)
 
-# Setup Async Plan
+# Setup Async Plan for Parallel Processing
 plan(multisession)
 
 # Load API Key
 tryCatch({ load_dot_env() }, error = function(e) { message("No .env file found.") })
 OPENROUTER_API_KEY <- Sys.getenv("OPENROUTER_API_KEY")
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION & CACHING ---
+
+# Initialize global cache environment to store historical data
+stock_cache <- new.env()
 
 sector_map <- list(
   "BANKING" = c("HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "HDFCLIFE.NS"),
@@ -33,8 +38,7 @@ sector_map <- list(
   "MINING" = c("ADANIENT.NS")
 )
 
-# CHANGED: Removed NIFTYBEES.NS and sorted alphabetically
-scan_list <- sort(unique(unlist(sector_map)))
+fallback_scan_list <- sort(unique(unlist(sector_map)))
 
 get_sector_name <- function(sym) {
   for(sec in names(sector_map)) {
@@ -42,6 +46,22 @@ get_sector_name <- function(sym) {
   }
   return("OTHER")
 }
+
+# Fetch Dynamic Stock Universe
+get_market_universe <- function() {
+  url <- "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+  
+  tryCatch({
+    nse_data <- read_csv(url, show_col_types = FALSE)
+    symbols <- paste0(nse_data$Symbol, ".NS")
+    return(symbols)
+  }, error = function(e) {
+    return(fallback_scan_list) 
+  })
+}
+
+# Load the universe on startup
+live_scan_list <- get_market_universe()
 
 # --- 2. HELPER: CRASH GUARD ---
 is_valid <- function(x) {
@@ -99,13 +119,31 @@ get_ai_best_pick <- function(symbol, score, price) {
 
 # --- 4. DATA ENGINE ---
 
+# Wrapper to check cache before pinging Yahoo
+get_cached_stock_data <- function(symbol, days_back = 200) {
+  if (exists(symbol, envir = stock_cache)) {
+    return(get(symbol, envir = stock_cache))
+  }
+  
+  tryCatch({
+    fetch_sym <- if(symbol == "^NSEI") "NIFTYBEES.NS" else symbol
+    raw_data <- getSymbols(fetch_sym, src = "yahoo", auto.assign = FALSE, 
+                           from = Sys.Date() - days_back, warnings = FALSE)
+    raw_data <- na.locf(raw_data, na.rm = TRUE)
+    
+    # Store in cache
+    assign(symbol, raw_data, envir = stock_cache)
+    return(raw_data)
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
 get_technical_analysis <- function(symbol, timeframe = "daily", market_score = NULL, top_sector = NULL) {
   
   data <- tryCatch({
-    fetch_sym <- symbol
-    if(symbol == "^NSEI") fetch_sym <- "NIFTYBEES.NS"
-    raw <- getSymbols(fetch_sym, src = "yahoo", auto.assign = FALSE, from = Sys.Date() - 700)
-    raw <- na.locf(raw, na.rm = TRUE)
+    raw <- get_cached_stock_data(symbol)
+    if(is.null(raw)) return(NULL)
     if(timeframe == "weekly") raw <- to.weekly(raw)
     raw
   }, error = function(e) return(NULL))
@@ -262,13 +300,13 @@ ui <- page_sidebar(
     selectInput("timeframe", "Timeframe Strategy:", 
                 choices = c("Swing (Daily)" = "daily", "Positional (Weekly)" = "weekly")),
     
-    selectizeInput("stock_input", "Analyze Asset", choices = scan_list, 
-                   options = list(placeholder = 'Search...')),
+    selectizeInput("stock_input", "Analyze Asset", choices = live_scan_list, 
+                   options = list(placeholder = 'Search Universe...')),
     
     actionButton("run_analysis", "Judge Stock", class = "btn-dark w-100"),
     hr(),
     h6("Market Scan"),
-    actionButton("scan_market", "Scan NIFTY50", class = "btn-danger w-100", icon = bsicons::bs_icon("radioactive")),
+    actionButton("scan_market", "Scan Market (Parallel)", class = "btn-danger w-100", icon = bsicons::bs_icon("radioactive")),
     br(), br(),
     downloadButton("downloadData", "Export Hit List (CSV)", class = "btn-outline-secondary w-100 btn-sm")
   ),
@@ -385,56 +423,71 @@ server <- function(input, output, session) {
     curr_mkt_score <- if(!is.null(mkt)) mkt$score else 50
     market_score(curr_mkt_score) 
     
-    withProgress(message = paste("SCANNING (", toupper(input$timeframe), ")..."), value = 0, {
-      
-      rows_list <- list()
-      sector_scores <- list()
-      total <- length(scan_list)
-      count <- 0
-      
-      for(sym in scan_list) {
-        count <- count + 1
-        incProgress(1/total)
-        
-        if (sym == "NIFTYBEES.NS" || sym == "^NSEI") next 
+    hit_list_data(NULL)
+    sector_data(NULL)
+    ai_output_val("Firing up parallel scanners...")
+    
+    # Store UI inputs to pass to the future environment cleanly
+    tf_val <- input$timeframe
+    universe <- live_scan_list
+    
+    future({
+      # Execute over the universe in parallel background threads
+      results <- future_lapply(universe, function(sym) {
+        if (sym == "NIFTYBEES.NS" || sym == "^NSEI") return(NULL)
         
         res <- tryCatch({
-           get_technical_analysis(sym, timeframe = input$timeframe, market_score = curr_mkt_score)
+          get_technical_analysis(sym, timeframe = tf_val, market_score = curr_mkt_score)
         }, error = function(e) return(NULL))
         
-        if(!is.null(res)) {
-          sec_name <- get_sector_name(sym)
-          if(res$score >= 0) { 
-            new_row <- data.frame(Symbol = sym, Sector = sec_name, Price = res$price, Score = res$score, 
-                                  VolRatio = res$vol_ratio, Verdict = res$verdict, Risk = res$risk)
-            rows_list[[length(rows_list) + 1]] <- new_row
-          }
-          if(sec_name != "OTHER") {
-            sector_scores[[sec_name]] <- c(sector_scores[[sec_name]], res$score)
-          }
+        # Pre-filter block 
+        if (!is.null(res) && res$score >= 0 && res$vol_ratio > 0.5 && res$price > 20) {
+          return(data.frame(
+            Symbol = sym, 
+            Sector = get_sector_name(sym), 
+            Price = res$price, 
+            Score = res$score, 
+            VolRatio = res$vol_ratio, 
+            Verdict = res$verdict, 
+            Risk = res$risk
+          ))
+        }
+        return(NULL)
+      }, future.seed = TRUE)
+      
+      # Bind non-null results
+      do.call(rbind, results[!sapply(results, is.null)])
+      
+    }) %...>% (function(valid_buys) {
+      
+      if (is.null(valid_buys) || nrow(valid_buys) == 0) {
+        valid_buys <- data.frame(Symbol=character(), Sector=character(), Price=numeric(), Score=numeric(), 
+                                 VolRatio=numeric(), Verdict=character(), Risk=character())
+        hit_list_data(valid_buys)
+        ai_output_val("Scan Complete: No strong setups found.")
+        return()
+      }
+      
+      # Sector Grouping & Analysis
+      sector_scores <- split(valid_buys$Score, valid_buys$Sector)
+      sec_df <- data.frame(Sector=character(), MedianScore=numeric())
+      
+      for(sec in names(sector_scores)) {
+        if(sec != "OTHER") {
+          avg <- median(sector_scores[[sec]], na.rm=TRUE)
+          sec_df <- rbind(sec_df, data.frame(Sector=sec, MedianScore=avg))
         }
       }
       
-      if(length(rows_list) > 0) {
-        valid_buys <- do.call(rbind, rows_list)
-      } else {
-        valid_buys <- data.frame(Symbol=character(), Sector=character(), Price=numeric(), Score=numeric(), 
-                                 VolRatio=numeric(), Verdict=character(), Risk=character())
-      }
-      
-      sec_df <- data.frame(Sector=character(), MedianScore=numeric())
-      for(sec in names(sector_scores)) {
-        avg <- median(sector_scores[[sec]], na.rm=TRUE)
-        sec_df <- rbind(sec_df, data.frame(Sector=sec, MedianScore=avg))
-      }
-      sec_df <- sec_df[order(-sec_df$MedianScore), ]
-      sector_data(sec_df)
-      
-      if(nrow(sec_df) > 0 && nrow(valid_buys) > 0) {
+      if(nrow(sec_df) > 0) {
+        sec_df <- sec_df[order(-sec_df$MedianScore), ]
+        sector_data(sec_df)
+        
         top_sec <- sec_df$Sector[1]
         is_top_sec <- valid_buys$Sector == top_sec
         valid_buys$Score[is_top_sec] <- pmin(valid_buys$Score[is_top_sec] + 5, 100)
         
+        # Adjust verdicts using finalized scores
         valid_buys$Verdict <- ifelse(valid_buys$Score >= 80, "▲ STRONG BUY",
                               ifelse(valid_buys$Score >= 75, "BUY",
                               ifelse(valid_buys$Score >= 60, "WATCH",
@@ -445,26 +498,27 @@ server <- function(input, output, session) {
                            ifelse(valid_buys$Score <= 40, "HIGH RISK", "⚠️ SPECULATIVE")))
       }
       
-      if(nrow(valid_buys) > 0) {
-        final_list <- valid_buys[valid_buys$Score >= 70, ]
-        if(nrow(final_list) > 0) final_list <- final_list[order(-final_list$Score), ]
-      } else {
-        final_list <- valid_buys
-      }
-      
+      # Compile Final Hit List
+      final_list <- valid_buys[valid_buys$Score >= 70, ]
+      if(nrow(final_list) > 0) final_list <- final_list[order(-final_list$Score), ]
       hit_list_data(final_list)
       
+      # Fire AI Best Pick
       if(nrow(final_list) > 0) {
         top_stock <- final_list[1,]
-        ai_output_val("Finding Scan Winner...")
+        ai_output_val(paste("Finding AI narrative for", top_stock$Symbol, "..."))
+        
         future({
           get_ai_best_pick(top_stock$Symbol, top_stock$Score, top_stock$Price)
         }) %...>% (function(ai_res) {
           ai_output_val(paste("🏆 TOP PICK:", top_stock$Symbol, "-", ai_res))
         })
       } else {
-        ai_output_val("Scan Complete: No strong buys found.")
+        ai_output_val("Scan Complete: Market looks weak.")
       }
+      
+    }) %...!% (function(error) {
+      ai_output_val(paste("Scanner Error:", error$message))
     })
   })
   
